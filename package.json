@@ -1,0 +1,49 @@
+{
+  "name": "psd-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for parsing PSD files - Extract layer info for LLM coding assistance",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "psd-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol", 
+    "psd",
+    "photoshop",
+    "parser",
+    "ai",
+    "llm",
+    "claude",
+    "cursor",
+    "design-to-code"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OWNER/psd-mcp-server"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ag-psd": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
