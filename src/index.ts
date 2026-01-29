@@ -840,6 +840,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "export_layer_image",
+        description:
+          "Export a single image layer by name. Use this when you need to export a specific layer with a custom filename.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            layerName: {
+              type: "string",
+              description:
+                "Name of the layer to export (partial match, case-insensitive)",
+            },
+            outputPath: {
+              type: "string",
+              description:
+                "Full output path including filename (e.g., /path/to/output/hero.png)",
+            },
+            scale: {
+              type: "number",
+              description: "Scale factor (default: 2 for @2x)",
+            },
+            format: {
+              type: "string",
+              enum: ["png", "jpg"],
+              description: "Image format (default: png)",
+            },
+            quality: {
+              type: "number",
+              description: "JPG quality 1-100 (default: 90)",
+            },
+          },
+          required: ["path", "layerName", "outputPath"],
+        },
+      },
+      {
         name: "export_all_vectors_as_svg",
         description:
           "Export all vector/shape layers as SVG files to a specified directory",
@@ -1191,6 +1229,92 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "export_layer_image": {
+        const {
+          path: filePath,
+          layerName,
+          outputPath: outPath,
+          scale = 2,
+          format = "png",
+          quality = 90,
+        } = args as {
+          path: string;
+          layerName: string;
+          outputPath: string;
+          scale?: number;
+          format?: "png" | "jpg";
+          quality?: number;
+        };
+        const absolutePath = path.resolve(filePath);
+        const absoluteOutputPath = path.resolve(outPath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: false,
+          skipThumbnail: true,
+        });
+
+        // Find the layer
+        const allImages = getAllImageLayers(psd.children || []);
+        const targetLayer = allImages.find((l) =>
+          l.name?.toLowerCase().includes(layerName.toLowerCase()),
+        );
+
+        if (!targetLayer) {
+          const suggestions = allImages
+            .slice(0, 5)
+            .map((l) => l.name)
+            .join(", ");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Layer "${layerName}" not found.\n\nAvailable image layers: ${suggestions || "none"}`,
+              },
+            ],
+          };
+        }
+
+        // Create output directory if needed
+        const outputDir = path.dirname(absoluteOutputPath);
+        if (!fs.existsSync(outputDir)) {
+          fs.mkdirSync(outputDir, { recursive: true });
+        }
+
+        const imageBuffer = layerToImageBuffer(
+          targetLayer,
+          scale,
+          format,
+          quality,
+        );
+        if (!imageBuffer) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Layer "${targetLayer.name}" has no image data.`,
+              },
+            ],
+          };
+        }
+
+        fs.writeFileSync(absoluteOutputPath, imageBuffer);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Exported "${targetLayer.name}" to ${absoluteOutputPath} (${format.toUpperCase()}, ${scale}x)`,
+            },
+          ],
+        };
+      }
+
       case "export_all_vectors_as_svg": {
         const {
           path: filePath,
@@ -1258,10 +1382,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const exported: string[] = [];
+
+        // Track filenames to avoid duplicates
+        const usedFilenames = new Map<string, number>();
+
         for (const layer of vectorLayers) {
           try {
             const svg = vectorLayerToSvg(layer, psd.width, psd.height);
-            const filename = sanitizeFilename(layer.name || "unnamed") + ".svg";
+            const baseName = sanitizeFilename(layer.name || "unnamed");
+
+            // Check for duplicate and add number suffix if needed
+            let finalName: string;
+            const count = usedFilenames.get(baseName) || 0;
+            if (count === 0) {
+              finalName = baseName;
+            } else {
+              finalName = `${baseName}_${String(count).padStart(2, "0")}`;
+            }
+            usedFilenames.set(baseName, count + 1);
+
+            const filename = finalName + ".svg";
             const outputPath = path.join(absoluteOutputDir, filename);
             fs.writeFileSync(outputPath, svg, "utf-8");
             exported.push(filename);
@@ -1339,6 +1479,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const suffix = scale !== 1 ? `@${scale}x` : "";
         const ext = format === "jpg" ? ".jpg" : ".png";
 
+        // Track filenames to avoid duplicates
+        const usedFilenames = new Map<string, number>();
+
         for (const layer of imageLayers) {
           try {
             const imageBuffer = layerToImageBuffer(
@@ -1348,8 +1491,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               quality,
             );
             if (imageBuffer) {
-              const filename =
-                sanitizeFilename(layer.name || "unnamed") + suffix + ext;
+              const baseName = sanitizeFilename(layer.name || "unnamed");
+
+              // Check for duplicate and add number suffix if needed
+              let finalName: string;
+              const count = usedFilenames.get(baseName) || 0;
+              if (count === 0) {
+                finalName = baseName;
+              } else {
+                finalName = `${baseName}_${String(count).padStart(2, "0")}`;
+              }
+              usedFilenames.set(baseName, count + 1);
+
+              const filename = finalName + suffix + ext;
               const outputPath = path.join(absoluteOutputDir, filename);
               fs.writeFileSync(outputPath, imageBuffer);
               exported.push(filename);
