@@ -1331,26 +1331,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "get_hero_section",
-        description:
-          "Analyze a PSD and extract hero section information optimized for coding (heading, subheading, CTA, background)",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            path: {
-              type: "string",
-              description: "Absolute path to the PSD file",
-            },
-            heroGroupName: {
-              type: "string",
-              description:
-                "Name of the hero group/folder in PSD (optional, will auto-detect if not provided)",
-            },
-          },
-          required: ["path"],
-        },
-      },
-      {
         name: "list_fonts",
         description:
           "List all fonts used in a PSD file with sizes, styles, colors, and which layers use them",
@@ -2179,81 +2159,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 null,
                 2,
               ),
-            },
-          ],
-        };
-      }
-
-      case "get_hero_section": {
-        const { path: filePath, heroGroupName } = args as {
-          path: string;
-          heroGroupName?: string;
-        };
-        const psdInfo = parsePsdFile(filePath);
-
-        // Find hero section (by name or auto-detect top-level large group)
-        let heroLayers = psdInfo.layers;
-        if (heroGroupName) {
-          const findGroup = (layers: LayerInfo[]): LayerInfo[] | null => {
-            for (const layer of layers) {
-              if (
-                layer.name.toLowerCase().includes(heroGroupName.toLowerCase())
-              ) {
-                return layer.children || [layer];
-              }
-              if (layer.children) {
-                const found = findGroup(layer.children);
-                if (found) return found;
-              }
-            }
-            return null;
-          };
-          heroLayers = findGroup(psdInfo.layers) || psdInfo.layers;
-        }
-
-        // Extract text layers for hero
-        const textLayers = getTextLayers(heroLayers);
-
-        // Categorize by size/position (heuristic)
-        const categorized = {
-          documentSize: { width: psdInfo.width, height: psdInfo.height },
-          heading: null as LayerInfo | null,
-          subheading: null as LayerInfo | null,
-          body: [] as LayerInfo[],
-          cta: [] as LayerInfo[],
-        };
-
-        // Sort by font size (largest = heading)
-        const sorted = [...textLayers].sort((a, b) => {
-          const sizeA = a.text?.fontSize || 0;
-          const sizeB = b.text?.fontSize || 0;
-          return sizeB - sizeA;
-        });
-
-        if (sorted.length > 0) categorized.heading = sorted[0];
-        if (sorted.length > 1) categorized.subheading = sorted[1];
-        if (sorted.length > 2) categorized.body = sorted.slice(2);
-
-        // Detect CTA (button-like names)
-        const ctaKeywords = [
-          "button",
-          "cta",
-          "btn",
-          "action",
-          "click",
-          "submit",
-        ];
-        for (const layer of heroLayers) {
-          if (ctaKeywords.some((kw) => layer.name.toLowerCase().includes(kw))) {
-            categorized.cta.push(layer);
-          }
-        }
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(categorized, null, 2),
             },
           ],
         };
