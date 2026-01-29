@@ -801,6 +801,120 @@ function getTextLayers(layers: LayerInfo[]): LayerInfo[] {
 // Note: Image layer export removed for simplicity
 // For image layers, you can export them from Photoshop/Affinity separately
 
+// Smart Object Types
+interface SmartObjectInfo {
+  layerName: string;
+  type: "vector" | "raster" | "imageStack" | "unknown";
+  transform?: {
+    xx: number;
+    xy: number;
+    yx: number;
+    yy: number;
+    tx: number;
+    ty: number;
+  };
+  width?: number;
+  height?: number;
+  linkedFileId?: string;
+  linkedFileName?: string;
+  linkedFileType?: string;
+  hasEmbeddedData: boolean;
+  externalFilePath?: string; // Path if external file was found
+}
+
+// Get all smart object layers from PSD
+function getAllSmartObjectLayers(
+  layers: Layer[],
+): { layer: Layer; path: string[] }[] {
+  const result: { layer: Layer; path: string[] }[] = [];
+
+  function traverse(items: Layer[], currentPath: string[]) {
+    for (const layer of items) {
+      if (layer.placedLayer) {
+        result.push({ layer, path: [...currentPath, layer.name || "Unnamed"] });
+      }
+      if (layer.children) {
+        traverse(layer.children, [...currentPath, layer.name || "Unnamed"]);
+      }
+    }
+  }
+
+  traverse(layers, []);
+  return result;
+}
+
+// Extract smart object information
+function extractSmartObjectInfo(
+  layer: Layer,
+  linkedFiles: any[] | undefined,
+  psdFilePath?: string,
+): SmartObjectInfo {
+  const placed = layer.placedLayer!;
+
+  // Determine type (ag-psd uses "image stack" not "imageStack")
+  let soType: SmartObjectInfo["type"] = "unknown";
+  if (placed.type === "vector") {
+    soType = "vector";
+  } else if (placed.type === "raster") {
+    soType = "raster";
+  } else if (placed.type === "image stack") {
+    soType = "imageStack";
+  }
+
+  // Find linked file
+  let linkedFile: any = undefined;
+  if (placed.id && linkedFiles) {
+    linkedFile = linkedFiles.find((f: any) => f.id === placed.id);
+  }
+
+  // Transform is an array [xx, xy, yx, yy, tx, ty] in ag-psd
+  const transform = placed.transform as number[] | undefined;
+
+  // Check for external file if no embedded data
+  let externalFilePath: string | undefined;
+  const hasEmbeddedData = !!(linkedFile?.data && linkedFile.data.length > 0);
+
+  if (!hasEmbeddedData && linkedFile?.name && psdFilePath) {
+    const psdDir = path.dirname(psdFilePath);
+    const linkedFileName = linkedFile.name;
+    const possiblePaths = [
+      path.join(psdDir, linkedFileName),
+      path.join(psdDir, "Links", linkedFileName),
+      path.join(psdDir, "links", linkedFileName),
+      path.join(psdDir, "..", linkedFileName),
+    ];
+    for (const tryPath of possiblePaths) {
+      if (fs.existsSync(tryPath)) {
+        externalFilePath = tryPath;
+        break;
+      }
+    }
+  }
+
+  return {
+    layerName: layer.name || "Unnamed",
+    type: soType,
+    transform:
+      transform && transform.length >= 6
+        ? {
+            xx: transform[0],
+            xy: transform[1],
+            yx: transform[2],
+            yy: transform[3],
+            tx: transform[4],
+            ty: transform[5],
+          }
+        : undefined,
+    width: placed.width,
+    height: placed.height,
+    linkedFileId: placed.id,
+    linkedFileName: linkedFile?.name,
+    linkedFileType: linkedFile?.type,
+    hasEmbeddedData,
+    externalFilePath,
+  };
+}
+
 // Create MCP Server
 const server = new Server(
   {
@@ -1104,6 +1218,51 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["path"],
+        },
+      },
+      {
+        name: "list_smart_objects",
+        description:
+          "List all Smart Object layers in a PSD file. Shows their type (vector/raster/imageStack), linked file info, and whether embedded data is available.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_smart_object_content",
+        description:
+          "Get the content of an embedded Smart Object. If the embedded file is a PSD, it will be parsed recursively to show its layers. Supports PSD, PSB, AI, and other embedded formats.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            layerName: {
+              type: "string",
+              description:
+                "Name of the Smart Object layer to read (partial match, case-insensitive)",
+            },
+            layerIndex: {
+              type: "number",
+              description:
+                "When multiple Smart Objects match the name, specify which one (0-based index)",
+            },
+            outputPath: {
+              type: "string",
+              description:
+                "Optional: Save the embedded file data to this path. If not provided, embedded PSD files are parsed and layers are returned.",
+            },
+          },
+          required: ["path", "layerName"],
         },
       },
     ],
@@ -1944,6 +2103,348 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text" as const,
               text: JSON.stringify(categorized, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "list_smart_objects": {
+        const filePath = (args as { path: string }).path;
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+          skipLinkedFilesData: false, // We need linked file info
+        });
+
+        const smartObjects = getAllSmartObjectLayers(psd.children || []);
+
+        if (smartObjects.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No Smart Object layers found in this PSD file.",
+              },
+            ],
+          };
+        }
+
+        const results = smartObjects.map(({ layer, path: layerPath }) => {
+          const info = extractSmartObjectInfo(
+            layer,
+            psd.linkedFiles,
+            absolutePath,
+          );
+          return {
+            ...info,
+            layerPath: layerPath.join(" > "),
+          };
+        });
+
+        const lines = [
+          `Found ${smartObjects.length} Smart Object(s):\n`,
+          ...results.map((so, i) => {
+            let statusLine: string;
+            if (so.hasEmbeddedData) {
+              statusLine = "✓ embedded data available";
+            } else if (so.externalFilePath) {
+              statusLine = `✓ external file found: ${so.externalFilePath}`;
+            } else if (so.linkedFileName) {
+              statusLine = `✗ external link (file not found: ${so.linkedFileName})`;
+            } else {
+              statusLine = "✗ no data available";
+            }
+            return [
+              `${i + 1}. **${so.layerName}**`,
+              `   Path: ${so.layerPath}`,
+              `   Type: ${so.type}`,
+              so.linkedFileName ? `   File: ${so.linkedFileName}` : null,
+              so.linkedFileType ? `   Format: ${so.linkedFileType}` : null,
+              so.width && so.height
+                ? `   Size: ${so.width}x${so.height}`
+                : null,
+              `   Status: ${statusLine}`,
+              "",
+            ]
+              .filter((l) => l !== null)
+              .join("\n");
+          }),
+        ];
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: lines.join("\n"),
+            },
+          ],
+        };
+      }
+
+      case "get_smart_object_content": {
+        const {
+          path: filePath,
+          layerName,
+          layerIndex,
+          outputPath,
+        } = args as {
+          path: string;
+          layerName: string;
+          layerIndex?: number;
+          outputPath?: string;
+        };
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+          skipLinkedFilesData: false, // Need the embedded data
+        });
+
+        const smartObjects = getAllSmartObjectLayers(psd.children || []);
+
+        // Find matching smart objects
+        const matchingSOs = smartObjects.filter(({ layer }) =>
+          layer.name?.toLowerCase().includes(layerName.toLowerCase()),
+        );
+
+        if (matchingSOs.length === 0) {
+          const suggestions = smartObjects
+            .slice(0, 5)
+            .map(({ layer }) => layer.name)
+            .join(", ");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Smart Object "${layerName}" not found.\n\nAvailable Smart Objects: ${suggestions || "none"}`,
+              },
+            ],
+          };
+        }
+
+        // If multiple matches and no index specified, show options
+        if (matchingSOs.length > 1 && layerIndex === undefined) {
+          const options = matchingSOs
+            .map(
+              ({ layer, path: p }, i) =>
+                `  ${i}: "${layer.name}" (${p.join(" > ")})`,
+            )
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Found ${matchingSOs.length} Smart Objects matching "${layerName}". Please specify layerIndex:\n\n${options}`,
+              },
+            ],
+          };
+        }
+
+        // Select target
+        const targetIndex = layerIndex ?? 0;
+        if (targetIndex >= matchingSOs.length) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `layerIndex ${targetIndex} is out of range. Only ${matchingSOs.length} Smart Object(s) found.`,
+              },
+            ],
+          };
+        }
+
+        const targetSO = matchingSOs[targetIndex];
+        const placed = targetSO.layer.placedLayer!;
+
+        // Find linked file data
+        let linkedFile: any = undefined;
+        if (placed.id && psd.linkedFiles) {
+          linkedFile = psd.linkedFiles.find((f: any) => f.id === placed.id);
+        }
+
+        // If no embedded data, try to find the external linked file
+        let fileData: Uint8Array | null = null;
+        let fileType = linkedFile?.type || "unknown";
+        let externalFilePath: string | null = null;
+
+        if (linkedFile?.data && linkedFile.data.length > 0) {
+          fileData = linkedFile.data as Uint8Array;
+        } else if (linkedFile?.name) {
+          // Try to find external file relative to the PSD
+          const psdDir = path.dirname(absolutePath);
+          const linkedFileName = linkedFile.name;
+
+          // Possible locations to search for the linked file
+          const possiblePaths = [
+            path.join(psdDir, linkedFileName), // Same directory
+            path.join(psdDir, "Links", linkedFileName), // Links subfolder (common in Adobe)
+            path.join(psdDir, "links", linkedFileName), // links subfolder (lowercase)
+            path.join(psdDir, "..", linkedFileName), // Parent directory
+          ];
+
+          for (const tryPath of possiblePaths) {
+            if (fs.existsSync(tryPath)) {
+              externalFilePath = tryPath;
+              fileData = new Uint8Array(fs.readFileSync(tryPath));
+              break;
+            }
+          }
+
+          if (!fileData) {
+            const info = extractSmartObjectInfo(
+              targetSO.layer,
+              psd.linkedFiles,
+            );
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: [
+                    `Smart Object "${targetSO.layer.name}" is an external link.`,
+                    "",
+                    `Linked file: ${linkedFileName}`,
+                    linkedFile?.type ? `File type: ${linkedFile.type}` : "",
+                    info.type !== "unknown"
+                      ? `Smart Object type: ${info.type}`
+                      : "",
+                    "",
+                    "Could not find the linked file in these locations:",
+                    ...possiblePaths.map((p) => `  - ${p}`),
+                    "",
+                    "Please ensure the linked file exists in one of these locations.",
+                  ]
+                    .filter((l) => l)
+                    .join("\n"),
+                },
+              ],
+            };
+          }
+        } else {
+          const info = extractSmartObjectInfo(targetSO.layer, psd.linkedFiles);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  `Smart Object "${targetSO.layer.name}" has no embedded data and no linked file info.`,
+                  "",
+                  info.type !== "unknown"
+                    ? `Smart Object type: ${info.type}`
+                    : "",
+                ]
+                  .filter((l) => l)
+                  .join("\n"),
+              },
+            ],
+          };
+        }
+
+        const embeddedData = fileData;
+        const dataSource = externalFilePath
+          ? `external file: ${externalFilePath}`
+          : "embedded data";
+
+        // If output path specified, save the raw embedded file
+        if (outputPath) {
+          const absoluteOutputPath = path.resolve(outputPath);
+          const outputDir = path.dirname(absoluteOutputPath);
+          if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+          }
+          fs.writeFileSync(absoluteOutputPath, Buffer.from(embeddedData));
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Saved file (${fileType}, ${embeddedData.length} bytes) from ${dataSource} to: ${absoluteOutputPath}`,
+              },
+            ],
+          };
+        }
+
+        // Try to parse as PSD if it looks like one
+        const isPsd =
+          fileType === "psd" ||
+          fileType === "psb" ||
+          linkedFile.name?.toLowerCase().endsWith(".psd") ||
+          linkedFile.name?.toLowerCase().endsWith(".psb");
+
+        if (isPsd) {
+          try {
+            const embeddedPsd = readPsd(Buffer.from(embeddedData), {
+              skipCompositeImageData: true,
+              skipLayerImageData: true,
+              skipThumbnail: true,
+            });
+
+            const embeddedLayers =
+              embeddedPsd.children?.map(extractLayerInfo) || [];
+            const tree = formatLayerTree(embeddedLayers);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: [
+                    `**Smart Object: ${targetSO.layer.name}**`,
+                    `Source: ${dataSource}`,
+                    `PSD Size: ${embeddedPsd.width}x${embeddedPsd.height}`,
+                    "",
+                    "## Layers inside Smart Object:",
+                    "",
+                    tree,
+                  ].join("\n"),
+                },
+              ],
+            };
+          } catch (parseError) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: [
+                    `Smart Object "${targetSO.layer.name}" contains embedded data (${embeddedData.length} bytes).`,
+                    `File type: ${fileType}`,
+                    "",
+                    "Could not parse as PSD. Use outputPath to extract the raw file.",
+                  ].join("\n"),
+                },
+              ],
+            };
+          }
+        }
+
+        // For non-PSD files, return info about the data
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: [
+                `**Smart Object: ${targetSO.layer.name}**`,
+                `Source: ${dataSource}`,
+                `File type: ${fileType}`,
+                `Data size: ${embeddedData.length} bytes`,
+                linkedFile?.name ? `Original name: ${linkedFile.name}` : "",
+                "",
+                "This is not a PSD file. Use outputPath to extract the file.",
+              ]
+                .filter((l) => l)
+                .join("\n"),
             },
           ],
         };
