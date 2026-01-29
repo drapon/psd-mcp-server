@@ -5,9 +5,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import "ag-psd/initialize-canvas.js";
 import { readPsd, Layer, Psd, BezierPath, VectorContent } from "ag-psd";
 import * as fs from "fs";
 import * as path from "path";
+import { createCanvas } from "canvas";
 
 // Types
 interface LayerInfo {
@@ -130,8 +132,8 @@ function parsePsdFile(filePath: string): PsdInfo {
 
   const buffer = fs.readFileSync(absolutePath);
   const psd = readPsd(buffer, {
-    skipCompositeImageData: false,
-    skipLayerImageData: false,
+    skipCompositeImageData: true,
+    skipLayerImageData: true,
     skipThumbnail: true,
   });
 
@@ -305,6 +307,75 @@ function vectorLayerToSvg(layer: Layer, width: number, height: number): string {
   return svgParts.join("\n");
 }
 
+// Get all image layers (layers with canvas data)
+function getAllImageLayers(layers: Layer[]): Layer[] {
+  const result: Layer[] = [];
+
+  function traverse(items: Layer[]) {
+    for (const layer of items) {
+      // Has canvas and is not a group
+      if (layer.canvas && !layer.children) {
+        result.push(layer);
+      }
+      if (layer.children) {
+        traverse(layer.children);
+      }
+    }
+  }
+
+  traverse(layers);
+  return result;
+}
+
+// Get image layers from a specific group
+function getImageLayersFromGroup(layers: Layer[], groupName: string): Layer[] {
+  // Find the group first
+  function findGroup(items: Layer[]): Layer | null {
+    for (const layer of items) {
+      if (
+        layer.name?.toLowerCase().includes(groupName.toLowerCase()) &&
+        layer.children
+      ) {
+        return layer;
+      }
+      if (layer.children) {
+        const found = findGroup(layer.children);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const group = findGroup(layers);
+  if (!group || !group.children) return [];
+
+  return getAllImageLayers(group.children);
+}
+
+// Export layer canvas to PNG buffer
+function layerToPngBuffer(layer: Layer, scale: number = 2): Buffer | null {
+  if (!layer.canvas) return null;
+
+  const srcCanvas = layer.canvas as any;
+  const width = srcCanvas.width * scale;
+  const height = srcCanvas.height * scale;
+
+  // Create scaled canvas
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+
+  // Scale and draw
+  ctx.scale(scale, scale);
+  ctx.drawImage(srcCanvas, 0, 0);
+
+  return canvas.toBuffer("image/png");
+}
+
+// Sanitize filename
+function sanitizeFilename(name: string): string {
+  return name.replace(/[<>:"/\\|?*]/g, "_").replace(/\s+/g, "_");
+}
+
 // Format layers as tree structure
 function formatLayerTree(layers: LayerInfo[], prefix: string = ""): string {
   const lines: string[] = [];
@@ -419,6 +490,56 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "export_all_vectors_as_svg",
+        description:
+          "Export all vector/shape layers as SVG files to a specified directory",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            outputDir: {
+              type: "string",
+              description: "Directory to save SVG files",
+            },
+            groupName: {
+              type: "string",
+              description: "Optional: Only export vectors from this group",
+            },
+          },
+          required: ["path", "outputDir"],
+        },
+      },
+      {
+        name: "export_images",
+        description:
+          "Export image layers as PNG files (@2x scale for Retina). Can export from a specific group or all images.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            outputDir: {
+              type: "string",
+              description: "Directory to save PNG files",
+            },
+            groupName: {
+              type: "string",
+              description: "Optional: Only export images from this group",
+            },
+            scale: {
+              type: "number",
+              description: "Scale factor (default: 2 for @2x)",
+            },
+          },
+          required: ["path", "outputDir"],
+        },
+      },
       {
         name: "list_vector_layers",
         description:
@@ -587,6 +708,174 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case "export_all_vectors_as_svg": {
+        const {
+          path: filePath,
+          outputDir,
+          groupName,
+        } = args as {
+          path: string;
+          outputDir: string;
+          groupName?: string;
+        };
+        const absolutePath = path.resolve(filePath);
+        const absoluteOutputDir = path.resolve(outputDir);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        // Create output directory if it doesn't exist
+        if (!fs.existsSync(absoluteOutputDir)) {
+          fs.mkdirSync(absoluteOutputDir, { recursive: true });
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+        });
+
+        let vectorLayers: Layer[];
+        if (groupName) {
+          // Find group and get vectors from it
+          const findGroup = (layers: Layer[]): Layer | null => {
+            for (const layer of layers) {
+              if (
+                layer.name?.toLowerCase().includes(groupName.toLowerCase()) &&
+                layer.children
+              ) {
+                return layer;
+              }
+              if (layer.children) {
+                const found = findGroup(layer.children);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+          const group = findGroup(psd.children || []);
+          vectorLayers = group ? getAllVectorLayers(group.children || []) : [];
+        } else {
+          vectorLayers = getAllVectorLayers(psd.children || []);
+        }
+
+        if (vectorLayers.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: groupName
+                  ? `No vector layers found in group "${groupName}".`
+                  : "No vector layers found in this PSD file.",
+              },
+            ],
+          };
+        }
+
+        const exported: string[] = [];
+        for (const layer of vectorLayers) {
+          try {
+            const svg = vectorLayerToSvg(layer, psd.width, psd.height);
+            const filename = sanitizeFilename(layer.name || "unnamed") + ".svg";
+            const outputPath = path.join(absoluteOutputDir, filename);
+            fs.writeFileSync(outputPath, svg, "utf-8");
+            exported.push(filename);
+          } catch (e) {
+            // Skip layers that fail to export
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Exported ${exported.length} SVG file(s) to ${absoluteOutputDir}:\n\n${exported.map((f) => `- ${f}`).join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      case "export_images": {
+        const {
+          path: filePath,
+          outputDir,
+          groupName,
+          scale = 2,
+        } = args as {
+          path: string;
+          outputDir: string;
+          groupName?: string;
+          scale?: number;
+        };
+        const absolutePath = path.resolve(filePath);
+        const absoluteOutputDir = path.resolve(outputDir);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        // Create output directory if it doesn't exist
+        if (!fs.existsSync(absoluteOutputDir)) {
+          fs.mkdirSync(absoluteOutputDir, { recursive: true });
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: false, // Need image data for export
+          skipThumbnail: true,
+        });
+
+        let imageLayers: Layer[];
+        if (groupName) {
+          imageLayers = getImageLayersFromGroup(psd.children || [], groupName);
+        } else {
+          imageLayers = getAllImageLayers(psd.children || []);
+        }
+
+        if (imageLayers.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: groupName
+                  ? `No image layers found in group "${groupName}".`
+                  : "No image layers found in this PSD file.",
+              },
+            ],
+          };
+        }
+
+        const exported: string[] = [];
+        const suffix = scale !== 1 ? `@${scale}x` : "";
+
+        for (const layer of imageLayers) {
+          try {
+            const pngBuffer = layerToPngBuffer(layer, scale);
+            if (pngBuffer) {
+              const filename =
+                sanitizeFilename(layer.name || "unnamed") + suffix + ".png";
+              const outputPath = path.join(absoluteOutputDir, filename);
+              fs.writeFileSync(outputPath, pngBuffer);
+              exported.push(filename);
+            }
+          } catch (e) {
+            // Skip layers that fail to export
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Exported ${exported.length} PNG file(s) at ${scale}x to ${absoluteOutputDir}:\n\n${exported.map((f) => `- ${f}`).join("\n")}`,
+            },
+          ],
+        };
+      }
+
       case "list_vector_layers": {
         const filePath = (args as { path: string }).path;
         const absolutePath = path.resolve(filePath);

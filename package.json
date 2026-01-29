@@ -43,7 +43,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "ag-psd": "^19.0.0"
+    "ag-psd": "^19.0.0",
+    "canvas": "^3.2.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
