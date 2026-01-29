@@ -376,6 +376,320 @@ function sanitizeFilename(name: string): string {
   return name.replace(/[<>:"/\\|?*]/g, "_").replace(/\s+/g, "_");
 }
 
+// Color extraction types
+interface ExtractedColor {
+  hex: string;
+  rgb: { r: number; g: number; b: number };
+  source: string;
+  layerName: string;
+}
+
+interface GradientInfo {
+  name?: string;
+  colors: string[];
+  source: string;
+  layerName: string;
+}
+
+interface ColorPalette {
+  solidColors: ExtractedColor[];
+  gradients: GradientInfo[];
+  uniqueColors: string[];
+}
+
+// Convert any Color type to hex
+function anyColorToHex(color: any): string | null {
+  if (!color) return null;
+
+  let r: number, g: number, b: number;
+
+  // FRGB format (0-1 range)
+  if (typeof color.fr === "number") {
+    r = Math.round(color.fr * 255);
+    g = Math.round(color.fg * 255);
+    b = Math.round(color.fb * 255);
+  }
+  // RGB/RGBA format (0-255 range)
+  else if (typeof color.r === "number") {
+    r = Math.round(color.r);
+    g = Math.round(color.g);
+    b = Math.round(color.b);
+  }
+  // Grayscale
+  else if (typeof color.k === "number" && !("c" in color)) {
+    const gray = Math.round((1 - color.k) * 255);
+    r = g = b = gray;
+  }
+  // HSB - convert to RGB
+  else if (
+    typeof color.h === "number" &&
+    typeof color.s === "number" &&
+    typeof color.b === "number"
+  ) {
+    const h = color.h / 360;
+    const s = color.s;
+    const v = color.b;
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = v * (1 - s);
+    const q = v * (1 - f * s);
+    const t = v * (1 - (1 - f) * s);
+    switch (i % 6) {
+      case 0:
+        r = v * 255;
+        g = t * 255;
+        b = p * 255;
+        break;
+      case 1:
+        r = q * 255;
+        g = v * 255;
+        b = p * 255;
+        break;
+      case 2:
+        r = p * 255;
+        g = v * 255;
+        b = t * 255;
+        break;
+      case 3:
+        r = p * 255;
+        g = q * 255;
+        b = v * 255;
+        break;
+      case 4:
+        r = t * 255;
+        g = p * 255;
+        b = v * 255;
+        break;
+      case 5:
+        r = v * 255;
+        g = p * 255;
+        b = q * 255;
+        break;
+      default:
+        r = g = b = 0;
+    }
+    r = Math.round(r);
+    g = Math.round(g);
+    b = Math.round(b);
+  }
+  // LAB - simplified conversion
+  else if (typeof color.l === "number" && typeof color.a === "number") {
+    // Simplified LAB to RGB
+    const y = (color.l + 16) / 116;
+    const x = color.a / 500 + y;
+    const z = y - color.b / 200;
+
+    const x3 = x * x * x;
+    const y3 = y * y * y;
+    const z3 = z * z * z;
+
+    const xn = x3 > 0.008856 ? x3 : (x - 16 / 116) / 7.787;
+    const yn = y3 > 0.008856 ? y3 : (y - 16 / 116) / 7.787;
+    const zn = z3 > 0.008856 ? z3 : (z - 16 / 116) / 7.787;
+
+    // XYZ to RGB
+    const xr = xn * 0.95047;
+    const yr = yn * 1.0;
+    const zr = zn * 1.08883;
+
+    r = Math.round(
+      Math.max(
+        0,
+        Math.min(255, (xr * 3.2406 + yr * -1.5372 + zr * -0.4986) * 255),
+      ),
+    );
+    g = Math.round(
+      Math.max(
+        0,
+        Math.min(255, (xr * -0.9689 + yr * 1.8758 + zr * 0.0415) * 255),
+      ),
+    );
+    b = Math.round(
+      Math.max(
+        0,
+        Math.min(255, (xr * 0.0557 + yr * -0.204 + zr * 1.057) * 255),
+      ),
+    );
+  }
+  // CMYK
+  else if (
+    typeof color.c === "number" &&
+    typeof color.m === "number" &&
+    typeof color.y === "number" &&
+    typeof color.k === "number"
+  ) {
+    r = Math.round(255 * (1 - color.c) * (1 - color.k));
+    g = Math.round(255 * (1 - color.m) * (1 - color.k));
+    b = Math.round(255 * (1 - color.y) * (1 - color.k));
+  } else {
+    return null;
+  }
+
+  // Clamp values
+  r = Math.max(0, Math.min(255, r));
+  g = Math.max(0, Math.min(255, g));
+  b = Math.max(0, Math.min(255, b));
+
+  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`.toUpperCase();
+}
+
+// Extract all colors from a layer
+function extractColorsFromLayer(
+  layer: Layer,
+  layerName: string,
+): { colors: ExtractedColor[]; gradients: GradientInfo[] } {
+  const colors: ExtractedColor[] = [];
+  const gradients: GradientInfo[] = [];
+
+  const addColor = (color: any, source: string) => {
+    const hex = anyColorToHex(color);
+    if (hex) {
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      colors.push({ hex, rgb: { r, g, b }, source, layerName });
+    }
+  };
+
+  const addGradient = (gradient: any, source: string) => {
+    if (gradient?.colorStops) {
+      const gradientColors = gradient.colorStops
+        .map((stop: any) => anyColorToHex(stop.color))
+        .filter((c: string | null): c is string => c !== null);
+      if (gradientColors.length > 0) {
+        gradients.push({
+          name: gradient.name,
+          colors: gradientColors,
+          source,
+          layerName,
+        });
+      }
+    }
+  };
+
+  // Text color
+  if (layer.text?.style?.fillColor) {
+    addColor(layer.text.style.fillColor, "text");
+  }
+
+  // Vector fill
+  if (layer.vectorFill) {
+    if (layer.vectorFill.type === "color") {
+      addColor(layer.vectorFill.color, "vector-fill");
+    } else if ("colorStops" in layer.vectorFill) {
+      addGradient(layer.vectorFill, "vector-fill-gradient");
+    }
+  }
+
+  // Vector stroke
+  if (layer.vectorStroke?.content) {
+    if (layer.vectorStroke.content.type === "color") {
+      addColor(layer.vectorStroke.content.color, "vector-stroke");
+    } else if ("colorStops" in layer.vectorStroke.content) {
+      addGradient(layer.vectorStroke.content, "vector-stroke-gradient");
+    }
+  }
+
+  // Layer effects
+  const effects = layer.effects;
+  if (effects) {
+    // Drop shadow
+    effects.dropShadow?.forEach((shadow, i) => {
+      if (shadow.enabled !== false && shadow.color) {
+        addColor(shadow.color, `drop-shadow${i > 0 ? `-${i + 1}` : ""}`);
+      }
+    });
+
+    // Inner shadow
+    effects.innerShadow?.forEach((shadow, i) => {
+      if (shadow.enabled !== false && shadow.color) {
+        addColor(shadow.color, `inner-shadow${i > 0 ? `-${i + 1}` : ""}`);
+      }
+    });
+
+    // Outer glow
+    if (effects.outerGlow?.enabled !== false && effects.outerGlow?.color) {
+      addColor(effects.outerGlow.color, "outer-glow");
+    }
+
+    // Inner glow
+    if (effects.innerGlow?.enabled !== false && effects.innerGlow?.color) {
+      addColor(effects.innerGlow.color, "inner-glow");
+    }
+
+    // Color overlay (solid fill)
+    effects.solidFill?.forEach((fill, i) => {
+      if (fill.enabled !== false && fill.color) {
+        addColor(fill.color, `color-overlay${i > 0 ? `-${i + 1}` : ""}`);
+      }
+    });
+
+    // Stroke effect
+    effects.stroke?.forEach((stroke, i) => {
+      if (stroke.enabled !== false) {
+        if (stroke.color) {
+          addColor(stroke.color, `stroke-effect${i > 0 ? `-${i + 1}` : ""}`);
+        }
+        if (stroke.gradient) {
+          addGradient(
+            stroke.gradient,
+            `stroke-gradient${i > 0 ? `-${i + 1}` : ""}`,
+          );
+        }
+      }
+    });
+
+    // Satin
+    if (effects.satin?.enabled !== false && effects.satin?.color) {
+      addColor(effects.satin.color, "satin");
+    }
+
+    // Gradient overlay
+    effects.gradientOverlay?.forEach((overlay, i) => {
+      if (overlay.enabled !== false && overlay.gradient) {
+        addGradient(
+          overlay.gradient,
+          `gradient-overlay${i > 0 ? `-${i + 1}` : ""}`,
+        );
+      }
+    });
+  }
+
+  return { colors, gradients };
+}
+
+// Extract all colors from PSD
+function extractAllColors(layers: Layer[]): ColorPalette {
+  const allColors: ExtractedColor[] = [];
+  const allGradients: GradientInfo[] = [];
+
+  function traverse(items: Layer[]) {
+    for (const layer of items) {
+      const { colors, gradients } = extractColorsFromLayer(
+        layer,
+        layer.name || "Unnamed",
+      );
+      allColors.push(...colors);
+      allGradients.push(...gradients);
+
+      if (layer.children) {
+        traverse(layer.children);
+      }
+    }
+  }
+
+  traverse(layers);
+
+  // Get unique colors
+  const uniqueColors = [...new Set(allColors.map((c) => c.hex))].sort();
+
+  return {
+    solidColors: allColors,
+    gradients: allGradients,
+    uniqueColors,
+  };
+}
+
 // Format layers as tree structure
 function formatLayerTree(layers: LayerInfo[], prefix: string = ""): string {
   const lines: string[] = [];
@@ -490,6 +804,27 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "extract_colors",
+        description:
+          "Extract all colors used in the PSD file including text colors, fills, strokes, layer effects (shadows, glows, overlays), and gradients",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            format: {
+              type: "string",
+              enum: ["summary", "detailed", "css"],
+              description:
+                "Output format: 'summary' for unique colors only, 'detailed' for all colors with sources, 'css' for CSS custom properties (default: summary)",
+            },
+          },
+          required: ["path"],
+        },
+      },
       {
         name: "export_all_vectors_as_svg",
         description:
@@ -708,6 +1043,129 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case "extract_colors": {
+        const { path: filePath, format = "summary" } = args as {
+          path: string;
+          format?: "summary" | "detailed" | "css";
+        };
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+        });
+
+        const palette = extractAllColors(psd.children || []);
+
+        if (
+          palette.uniqueColors.length === 0 &&
+          palette.gradients.length === 0
+        ) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No colors found in this PSD file.",
+              },
+            ],
+          };
+        }
+
+        let output: string;
+
+        if (format === "css") {
+          // Generate CSS custom properties
+          const cssLines = [":root {"];
+          palette.uniqueColors.forEach((hex, i) => {
+            cssLines.push(`  --color-${i + 1}: ${hex};`);
+          });
+          cssLines.push("");
+          palette.gradients.forEach((grad, i) => {
+            const gradientCss = `linear-gradient(90deg, ${grad.colors.join(", ")})`;
+            cssLines.push(`  --gradient-${i + 1}: ${gradientCss};`);
+          });
+          cssLines.push("}");
+          output = cssLines.join("\n");
+        } else if (format === "detailed") {
+          // Detailed output with sources
+          const lines = ["## Solid Colors\n"];
+
+          // Group by color
+          const colorMap = new Map<
+            string,
+            { sources: string[]; layers: string[] }
+          >();
+          for (const color of palette.solidColors) {
+            if (!colorMap.has(color.hex)) {
+              colorMap.set(color.hex, { sources: [], layers: [] });
+            }
+            const entry = colorMap.get(color.hex)!;
+            if (!entry.sources.includes(color.source)) {
+              entry.sources.push(color.source);
+            }
+            if (!entry.layers.includes(color.layerName)) {
+              entry.layers.push(color.layerName);
+            }
+          }
+
+          for (const [hex, info] of colorMap) {
+            lines.push(`**${hex}**`);
+            lines.push(`  Sources: ${info.sources.join(", ")}`);
+            lines.push(
+              `  Layers: ${info.layers.slice(0, 3).join(", ")}${info.layers.length > 3 ? ` (+${info.layers.length - 3} more)` : ""}`,
+            );
+            lines.push("");
+          }
+
+          if (palette.gradients.length > 0) {
+            lines.push("\n## Gradients\n");
+            for (const grad of palette.gradients) {
+              lines.push(`**${grad.name || "Unnamed"}** (${grad.source})`);
+              lines.push(`  Colors: ${grad.colors.join(" → ")}`);
+              lines.push(`  Layer: ${grad.layerName}`);
+              lines.push("");
+            }
+          }
+
+          output = lines.join("\n");
+        } else {
+          // Summary format
+          const lines = [
+            `Found ${palette.uniqueColors.length} unique color(s) and ${palette.gradients.length} gradient(s)`,
+            "",
+            "## Colors",
+            ...palette.uniqueColors.map((hex) => `- ${hex}`),
+          ];
+
+          if (palette.gradients.length > 0) {
+            lines.push("");
+            lines.push("## Gradients");
+            for (const grad of palette.gradients) {
+              lines.push(
+                `- ${grad.name || "Unnamed"}: ${grad.colors.join(" → ")}`,
+              );
+            }
+          }
+
+          output = lines.join("\n");
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: output,
+            },
+          ],
+        };
+      }
+
       case "export_all_vectors_as_svg": {
         const {
           path: filePath,
