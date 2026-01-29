@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readPsd, Layer, Psd } from "ag-psd";
+import { readPsd, Layer, Psd, BezierPath, VectorContent } from "ag-psd";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -155,6 +155,156 @@ function parsePsdFile(filePath: string): PsdInfo {
   };
 }
 
+// Convert VectorContent color to CSS color string
+function vectorContentToColor(
+  content: VectorContent | undefined,
+): string | undefined {
+  if (!content) return undefined;
+  if (content.type === "color") {
+    const color = content.color;
+    if ("r" in color) {
+      return `rgb(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)})`;
+    }
+  }
+  return undefined;
+}
+
+// Convert Bezier paths to SVG path data
+function bezierPathsToSvgPath(
+  paths: BezierPath[],
+  width: number,
+  height: number,
+): string {
+  const pathData: string[] = [];
+
+  for (const bezierPath of paths) {
+    const knots = bezierPath.knots;
+    if (knots.length === 0) continue;
+
+    // PSD bezier points are normalized (0-1), scale to document size
+    // points array: [prevAnchorX, prevAnchorY, anchorX, anchorY, nextAnchorX, nextAnchorY]
+    const scaleX = (v: number) => (v * width).toFixed(2);
+    const scaleY = (v: number) => (v * height).toFixed(2);
+
+    // Start with first knot
+    const firstKnot = knots[0];
+    const startX = scaleX(firstKnot.points[2]);
+    const startY = scaleY(firstKnot.points[3]);
+    pathData.push(`M ${startX} ${startY}`);
+
+    // Draw curves between knots
+    for (let i = 0; i < knots.length; i++) {
+      const currentKnot = knots[i];
+      const nextKnot = knots[(i + 1) % knots.length];
+
+      // Skip last segment if path is open
+      if (bezierPath.open && i === knots.length - 1) break;
+
+      // Control point 1: current knot's "next" anchor
+      const cp1x = scaleX(currentKnot.points[4]);
+      const cp1y = scaleY(currentKnot.points[5]);
+
+      // Control point 2: next knot's "prev" anchor
+      const cp2x = scaleX(nextKnot.points[0]);
+      const cp2y = scaleY(nextKnot.points[1]);
+
+      // End point: next knot's anchor
+      const endX = scaleX(nextKnot.points[2]);
+      const endY = scaleY(nextKnot.points[3]);
+
+      pathData.push(`C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${endX} ${endY}`);
+    }
+
+    // Close path if not open
+    if (!bezierPath.open) {
+      pathData.push("Z");
+    }
+  }
+
+  return pathData.join(" ");
+}
+
+// Find vector layer by name
+function findVectorLayer(layers: Layer[], name: string): Layer | null {
+  for (const layer of layers) {
+    if (
+      layer.name?.toLowerCase().includes(name.toLowerCase()) &&
+      layer.vectorMask
+    ) {
+      return layer;
+    }
+    if (layer.children) {
+      const found = findVectorLayer(layer.children, name);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// Get all vector layers
+function getAllVectorLayers(layers: Layer[]): Layer[] {
+  const result: Layer[] = [];
+
+  function traverse(items: Layer[]) {
+    for (const layer of items) {
+      if (layer.vectorMask) {
+        result.push(layer);
+      }
+      if (layer.children) {
+        traverse(layer.children);
+      }
+    }
+  }
+
+  traverse(layers);
+  return result;
+}
+
+// Convert a vector layer to SVG string
+function vectorLayerToSvg(layer: Layer, width: number, height: number): string {
+  if (!layer.vectorMask) {
+    throw new Error("Layer does not have vector data");
+  }
+
+  const paths = layer.vectorMask.paths;
+  const svgPath = bezierPathsToSvgPath(paths, width, height);
+
+  // Get fill color
+  const fillColor = vectorContentToColor(layer.vectorFill) || "#000000";
+
+  // Get stroke info
+  const stroke = layer.vectorStroke;
+  const strokeColor = stroke?.content
+    ? vectorContentToColor(stroke.content)
+    : undefined;
+  const strokeWidth = stroke?.lineWidth?.value || 0;
+  const strokeEnabled = stroke?.strokeEnabled !== false && strokeWidth > 0;
+
+  // Build SVG
+  const svgParts: string[] = [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `  <path d="${svgPath}"`,
+    `        fill="${layer.vectorFill ? fillColor : "none"}"`,
+  ];
+
+  if (strokeEnabled && strokeColor) {
+    svgParts.push(`        stroke="${strokeColor}"`);
+    svgParts.push(`        stroke-width="${strokeWidth}"`);
+    if (stroke?.lineCapType) {
+      svgParts.push(`        stroke-linecap="${stroke.lineCapType}"`);
+    }
+    if (stroke?.lineJoinType) {
+      svgParts.push(`        stroke-linejoin="${stroke.lineJoinType}"`);
+    }
+  }
+
+  svgParts.push(`  />`);
+  svgParts.push(`</svg>`);
+
+  return svgParts.join("\n");
+}
+
 // Format layers as tree structure
 function formatLayerTree(layers: LayerInfo[], prefix: string = ""): string {
   const lines: string[] = [];
@@ -269,6 +419,45 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "list_vector_layers",
+        description:
+          "List all vector/shape layers in a PSD file that can be exported as SVG",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "export_vector_as_svg",
+        description:
+          "Export a vector/shape layer as SVG. Returns the SVG string or saves to a file.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            layerName: {
+              type: "string",
+              description: "Name of the vector layer to export",
+            },
+            outputPath: {
+              type: "string",
+              description:
+                "Optional: Path to save the SVG file. If not provided, returns the SVG string.",
+            },
+          },
+          required: ["path", "layerName"],
+        },
+      },
       {
         name: "list_layers",
         description:
@@ -398,6 +587,118 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case "list_vector_layers": {
+        const filePath = (args as { path: string }).path;
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+        });
+
+        const vectorLayers = getAllVectorLayers(psd.children || []);
+
+        if (vectorLayers.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No vector layers found in this PSD file.",
+              },
+            ],
+          };
+        }
+
+        const layerList = vectorLayers
+          .map((layer) => {
+            const hasFill = !!layer.vectorFill;
+            const hasStroke = !!layer.vectorStroke?.strokeEnabled;
+            return `- ${layer.name} (fill: ${hasFill ? "yes" : "no"}, stroke: ${hasStroke ? "yes" : "no"})`;
+          })
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Found ${vectorLayers.length} vector layer(s):\n\n${layerList}`,
+            },
+          ],
+        };
+      }
+
+      case "export_vector_as_svg": {
+        const {
+          path: filePath,
+          layerName,
+          outputPath,
+        } = args as {
+          path: string;
+          layerName: string;
+          outputPath?: string;
+        };
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+        });
+
+        const vectorLayer = findVectorLayer(psd.children || [], layerName);
+
+        if (!vectorLayer) {
+          const allVectors = getAllVectorLayers(psd.children || []);
+          const suggestions = allVectors
+            .slice(0, 5)
+            .map((l) => l.name)
+            .join(", ");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Vector layer "${layerName}" not found.\n\nAvailable vector layers: ${suggestions || "none"}`,
+              },
+            ],
+          };
+        }
+
+        const svg = vectorLayerToSvg(vectorLayer, psd.width, psd.height);
+
+        if (outputPath) {
+          const absoluteOutputPath = path.resolve(outputPath);
+          fs.writeFileSync(absoluteOutputPath, svg, "utf-8");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `SVG saved to: ${absoluteOutputPath}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: svg,
+            },
+          ],
+        };
+      }
+
       case "list_layers": {
         const { path: filePath, depth } = args as {
           path: string;
