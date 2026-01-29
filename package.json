@@ -18,7 +18,7 @@
   },
   "keywords": [
     "mcp",
-    "model-context-protocol", 
+    "model-context-protocol",
     "psd",
     "photoshop",
     "parser",
@@ -28,11 +28,15 @@
     "cursor",
     "design-to-code"
   ],
-  "author": "",
+  "author": "drapon",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OWNER/psd-mcp-server"
+    "url": "https://github.com/drapon/psd-mcp-server"
+  },
+  "homepage": "https://github.com/drapon/psd-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/drapon/psd-mcp-server/issues"
   },
   "engines": {
     "node": ">=18"
