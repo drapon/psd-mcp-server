@@ -842,7 +842,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "export_layer_image",
         description:
-          "Export a single image layer by name. Use this when you need to export a specific layer with a custom filename.",
+          "Export a single image layer by name. Use layerIndex when multiple layers have the same name.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -854,6 +854,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "Name of the layer to export (partial match, case-insensitive)",
+            },
+            layerIndex: {
+              type: "number",
+              description:
+                "When multiple layers match the name, specify which one (0-based index). Use list_layers first to see the order.",
+            },
+            groupName: {
+              type: "string",
+              description:
+                "Optional: Search only within this group (useful for narrowing down same-named layers)",
             },
             outputPath: {
               type: "string",
@@ -1233,6 +1243,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const {
           path: filePath,
           layerName,
+          layerIndex,
+          groupName,
           outputPath: outPath,
           scale = 2,
           format = "png",
@@ -1240,6 +1252,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } = args as {
           path: string;
           layerName: string;
+          layerIndex?: number;
+          groupName?: string;
           outputPath: string;
           scale?: number;
           format?: "png" | "jpg";
@@ -1259,13 +1273,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           skipThumbnail: true,
         });
 
-        // Find the layer
-        const allImages = getAllImageLayers(psd.children || []);
-        const targetLayer = allImages.find((l) =>
+        // Get image layers (optionally from specific group)
+        let allImages: Layer[];
+        if (groupName) {
+          allImages = getImageLayersFromGroup(psd.children || [], groupName);
+        } else {
+          allImages = getAllImageLayers(psd.children || []);
+        }
+
+        // Find matching layers
+        const matchingLayers = allImages.filter((l) =>
           l.name?.toLowerCase().includes(layerName.toLowerCase()),
         );
 
-        if (!targetLayer) {
+        if (matchingLayers.length === 0) {
           const suggestions = allImages
             .slice(0, 5)
             .map((l) => l.name)
@@ -1274,11 +1295,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: "text" as const,
-                text: `Layer "${layerName}" not found.\n\nAvailable image layers: ${suggestions || "none"}`,
+                text: `Layer "${layerName}" not found${groupName ? ` in group "${groupName}"` : ""}.\n\nAvailable image layers: ${suggestions || "none"}`,
               },
             ],
           };
         }
+
+        // If multiple matches and no index specified, show options
+        if (matchingLayers.length > 1 && layerIndex === undefined) {
+          const options = matchingLayers
+            .map((l, i) => `  ${i}: "${l.name}"`)
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Found ${matchingLayers.length} layers matching "${layerName}". Please specify layerIndex:\n\n${options}\n\nExample: layerIndex: 0 for the first one`,
+              },
+            ],
+          };
+        }
+
+        // Select the target layer
+        const targetIndex = layerIndex ?? 0;
+        if (targetIndex >= matchingLayers.length) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `layerIndex ${targetIndex} is out of range. Only ${matchingLayers.length} layer(s) found.`,
+              },
+            ],
+          };
+        }
+        const targetLayer = matchingLayers[targetIndex];
 
         // Create output directory if needed
         const outputDir = path.dirname(absoluteOutputPath);
