@@ -352,8 +352,13 @@ function getImageLayersFromGroup(layers: Layer[], groupName: string): Layer[] {
   return getAllImageLayers(group.children);
 }
 
-// Export layer canvas to PNG buffer
-function layerToPngBuffer(layer: Layer, scale: number = 2): Buffer | null {
+// Export layer canvas to image buffer (PNG or JPG)
+function layerToImageBuffer(
+  layer: Layer,
+  scale: number = 2,
+  format: "png" | "jpg" = "png",
+  quality: number = 90,
+): Buffer | null {
   if (!layer.canvas) return null;
 
   const srcCanvas = layer.canvas as any;
@@ -364,10 +369,19 @@ function layerToPngBuffer(layer: Layer, scale: number = 2): Buffer | null {
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext("2d");
 
+  // For JPG, fill with white background (no transparency support)
+  if (format === "jpg") {
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, width, height);
+  }
+
   // Scale and draw
   ctx.scale(scale, scale);
   ctx.drawImage(srcCanvas, 0, 0);
 
+  if (format === "jpg") {
+    return canvas.toBuffer("image/jpeg", { quality: quality / 100 });
+  }
   return canvas.toBuffer("image/png");
 }
 
@@ -851,7 +865,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "export_images",
         description:
-          "Export image layers as PNG files (@2x scale for Retina). Can export from a specific group or all images.",
+          "Export image layers as PNG or JPG files (@2x scale for Retina). Can export from a specific group or all images.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -861,7 +875,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             outputDir: {
               type: "string",
-              description: "Directory to save PNG files",
+              description: "Directory to save image files",
             },
             groupName: {
               type: "string",
@@ -870,6 +884,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             scale: {
               type: "number",
               description: "Scale factor (default: 2 for @2x)",
+            },
+            format: {
+              type: "string",
+              enum: ["png", "jpg"],
+              description:
+                "Image format: 'png' (default, supports transparency) or 'jpg' (smaller file size)",
+            },
+            quality: {
+              type: "number",
+              description:
+                "JPG quality 1-100 (default: 90). Only applies to JPG format.",
             },
           },
           required: ["path", "outputDir"],
@@ -1261,11 +1286,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           outputDir,
           groupName,
           scale = 2,
+          format = "png",
+          quality = 90,
         } = args as {
           path: string;
           outputDir: string;
           groupName?: string;
           scale?: number;
+          format?: "png" | "jpg";
+          quality?: number;
         };
         const absolutePath = path.resolve(filePath);
         const absoluteOutputDir = path.resolve(outputDir);
@@ -1308,15 +1337,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const exported: string[] = [];
         const suffix = scale !== 1 ? `@${scale}x` : "";
+        const ext = format === "jpg" ? ".jpg" : ".png";
 
         for (const layer of imageLayers) {
           try {
-            const pngBuffer = layerToPngBuffer(layer, scale);
-            if (pngBuffer) {
+            const imageBuffer = layerToImageBuffer(
+              layer,
+              scale,
+              format,
+              quality,
+            );
+            if (imageBuffer) {
               const filename =
-                sanitizeFilename(layer.name || "unnamed") + suffix + ".png";
+                sanitizeFilename(layer.name || "unnamed") + suffix + ext;
               const outputPath = path.join(absoluteOutputDir, filename);
-              fs.writeFileSync(outputPath, pngBuffer);
+              fs.writeFileSync(outputPath, imageBuffer);
               exported.push(filename);
             }
           } catch (e) {
@@ -1324,11 +1359,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        const formatInfo =
+          format === "jpg" ? `JPG (quality: ${quality})` : "PNG";
         return {
           content: [
             {
               type: "text" as const,
-              text: `Exported ${exported.length} PNG file(s) at ${scale}x to ${absoluteOutputDir}:\n\n${exported.map((f) => `- ${f}`).join("\n")}`,
+              text: `Exported ${exported.length} ${formatInfo} file(s) at ${scale}x to ${absoluteOutputDir}:\n\n${exported.map((f) => `- ${f}`).join("\n")}`,
             },
           ],
         };
