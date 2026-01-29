@@ -801,6 +801,136 @@ function getTextLayers(layers: LayerInfo[]): LayerInfo[] {
 // Note: Image layer export removed for simplicity
 // For image layers, you can export them from Photoshop/Affinity separately
 
+// Font extraction types
+interface FontUsage {
+  fontName: string;
+  sizes: number[];
+  styles: {
+    regular: boolean;
+    bold: boolean;
+    italic: boolean;
+    fauxBold: boolean;
+    fauxItalic: boolean;
+  };
+  layers: string[];
+  colors: string[];
+}
+
+// Extract all fonts from text layers
+function extractAllFonts(layers: Layer[]): Map<string, FontUsage> {
+  const fontMap = new Map<string, FontUsage>();
+
+  function addFont(
+    fontName: string,
+    fontSize: number | undefined,
+    style: any,
+    layerName: string,
+  ) {
+    if (!fontName) return;
+
+    if (!fontMap.has(fontName)) {
+      fontMap.set(fontName, {
+        fontName,
+        sizes: [],
+        styles: {
+          regular: false,
+          bold: false,
+          italic: false,
+          fauxBold: false,
+          fauxItalic: false,
+        },
+        layers: [],
+        colors: [],
+      });
+    }
+
+    const usage = fontMap.get(fontName)!;
+
+    // Add size
+    if (fontSize && !usage.sizes.includes(fontSize)) {
+      usage.sizes.push(fontSize);
+    }
+
+    // Track styles
+    if (style?.fauxBold) {
+      usage.styles.fauxBold = true;
+    } else if (style?.fauxItalic) {
+      usage.styles.fauxItalic = true;
+    } else {
+      // Check font name for style hints
+      const nameLower = fontName.toLowerCase();
+      if (nameLower.includes("bold")) {
+        usage.styles.bold = true;
+      } else if (
+        nameLower.includes("italic") ||
+        nameLower.includes("oblique")
+      ) {
+        usage.styles.italic = true;
+      } else {
+        usage.styles.regular = true;
+      }
+    }
+
+    // Add layer name
+    if (!usage.layers.includes(layerName)) {
+      usage.layers.push(layerName);
+    }
+
+    // Add color
+    if (style?.fillColor) {
+      const hex = anyColorToHex(style.fillColor);
+      if (hex && !usage.colors.includes(hex)) {
+        usage.colors.push(hex);
+      }
+    }
+  }
+
+  function traverse(items: Layer[]) {
+    for (const layer of items) {
+      if (layer.text) {
+        const layerName = layer.name || "Unnamed";
+
+        // Check default style
+        if (layer.text.style?.font?.name) {
+          addFont(
+            layer.text.style.font.name,
+            layer.text.style.fontSize,
+            layer.text.style,
+            layerName,
+          );
+        }
+
+        // Check style runs (for text with multiple fonts)
+        if (layer.text.styleRuns) {
+          for (const run of layer.text.styleRuns) {
+            if (run.style?.font?.name) {
+              addFont(
+                run.style.font.name,
+                run.style.fontSize,
+                run.style,
+                layerName,
+              );
+            }
+          }
+        }
+      }
+
+      if (layer.children) {
+        traverse(layer.children);
+      }
+    }
+  }
+
+  traverse(layers);
+
+  // Sort sizes
+  for (const usage of fontMap.values()) {
+    usage.sizes.sort((a, b) => a - b);
+  }
+
+  return fontMap;
+}
+
 // Smart Object Types
 interface SmartObjectInfo {
   layerName: string;
@@ -1215,6 +1345,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "Name of the hero group/folder in PSD (optional, will auto-detect if not provided)",
+            },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "list_fonts",
+        description:
+          "List all fonts used in a PSD file with sizes, styles, colors, and which layers use them",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description: "Absolute path to the PSD file",
+            },
+            format: {
+              type: "string",
+              enum: ["summary", "detailed", "css"],
+              description:
+                "Output format: 'summary' for font list, 'detailed' for full info, 'css' for @font-face template (default: summary)",
             },
           },
           required: ["path"],
@@ -2103,6 +2254,124 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text" as const,
               text: JSON.stringify(categorized, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "list_fonts": {
+        const { path: filePath, format = "summary" } = args as {
+          path: string;
+          format?: "summary" | "detailed" | "css";
+        };
+        const absolutePath = path.resolve(filePath);
+
+        if (!fs.existsSync(absolutePath)) {
+          throw new Error(`File not found: ${absolutePath}`);
+        }
+
+        const buffer = fs.readFileSync(absolutePath);
+        const psd = readPsd(buffer, {
+          skipCompositeImageData: true,
+          skipLayerImageData: true,
+          skipThumbnail: true,
+        });
+
+        const fontMap = extractAllFonts(psd.children || []);
+
+        if (fontMap.size === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No fonts found in this PSD file (no text layers).",
+              },
+            ],
+          };
+        }
+
+        const fonts = Array.from(fontMap.values()).sort((a, b) =>
+          a.fontName.localeCompare(b.fontName),
+        );
+
+        let output: string;
+
+        if (format === "css") {
+          // Generate CSS @font-face template
+          const cssLines = [
+            "/* Font faces used in this PSD */",
+            "/* Replace src with actual font file paths */",
+            "",
+          ];
+          for (const font of fonts) {
+            const safeName = font.fontName.replace(/[^a-zA-Z0-9-]/g, "-");
+            cssLines.push(`@font-face {`);
+            cssLines.push(`  font-family: '${font.fontName}';`);
+            cssLines.push(
+              `  src: url('./fonts/${safeName}.woff2') format('woff2'),`,
+            );
+            cssLines.push(
+              `       url('./fonts/${safeName}.woff') format('woff');`,
+            );
+            cssLines.push(`  font-weight: normal;`);
+            cssLines.push(`  font-style: normal;`);
+            cssLines.push(`  font-display: swap;`);
+            cssLines.push(`}`);
+            cssLines.push(``);
+          }
+          cssLines.push(`/* CSS variables for font sizes */`);
+          cssLines.push(`:root {`);
+          const allSizes = [...new Set(fonts.flatMap((f) => f.sizes))].sort(
+            (a, b) => a - b,
+          );
+          allSizes.forEach((size, i) => {
+            cssLines.push(`  --font-size-${i + 1}: ${size}px;`);
+          });
+          cssLines.push(`}`);
+          output = cssLines.join("\n");
+        } else if (format === "detailed") {
+          // Detailed output
+          const lines = [`Found ${fonts.length} font(s):\n`];
+          for (const font of fonts) {
+            const styleList: string[] = [];
+            if (font.styles.regular) styleList.push("Regular");
+            if (font.styles.bold) styleList.push("Bold");
+            if (font.styles.italic) styleList.push("Italic");
+            if (font.styles.fauxBold) styleList.push("Faux Bold");
+            if (font.styles.fauxItalic) styleList.push("Faux Italic");
+
+            lines.push(`## ${font.fontName}`);
+            lines.push(`   Sizes: ${font.sizes.join("px, ")}px`);
+            lines.push(`   Styles: ${styleList.join(", ") || "Unknown"}`);
+            if (font.colors.length > 0) {
+              lines.push(`   Colors: ${font.colors.join(", ")}`);
+            }
+            lines.push(
+              `   Used in: ${font.layers.slice(0, 5).join(", ")}${font.layers.length > 5 ? ` (+${font.layers.length - 5} more)` : ""}`,
+            );
+            lines.push(``);
+          }
+          output = lines.join("\n");
+        } else {
+          // Summary format
+          const lines = [`Found ${fonts.length} font(s):\n`];
+          for (const font of fonts) {
+            const sizeRange =
+              font.sizes.length > 0
+                ? font.sizes.length === 1
+                  ? `${font.sizes[0]}px`
+                  : `${font.sizes[0]}-${font.sizes[font.sizes.length - 1]}px`
+                : "";
+            lines.push(`- **${font.fontName}** ${sizeRange}`);
+          }
+          output = lines.join("\n");
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: output,
             },
           ],
         };
